@@ -1,0 +1,25 @@
+target/
+
+# Local editor and OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
+
+# Local env and diagnostics
+.env
+.env.*
+*.log
+
+# Runtime data generated during local experiments
+*.sqlite
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+
+# Release artifacts copied out for manual testing
+dist/
+out/
