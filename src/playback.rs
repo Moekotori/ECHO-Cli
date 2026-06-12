@@ -4,7 +4,10 @@ use crate::error::{EchoError, Result};
 use crate::library::Track;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{
+    Arc, Mutex,
+    mpsc::{self, Receiver},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -35,6 +38,16 @@ pub enum PlaybackEvent {
         output: OutputStreamInfo,
     },
     Warning(String),
+    Paused {
+        title: String,
+    },
+    Resumed {
+        title: String,
+    },
+    Stopped {
+        title: String,
+        elapsed_ms: u128,
+    },
     Finished {
         title: String,
         elapsed_ms: u128,
@@ -45,6 +58,13 @@ pub enum PlaybackEvent {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackControl {
+    Pause,
+    Resume,
+    Stop,
+}
+
 pub struct PlaybackEngine;
 
 impl PlaybackEngine {
@@ -52,7 +72,20 @@ impl PlaybackEngine {
         Self
     }
 
-    pub fn play_blocking<F>(&self, track: &Track, mut on_event: F) -> Result<()>
+    pub fn play_blocking<F>(&self, track: &Track, on_event: F) -> Result<()>
+    where
+        F: FnMut(PlaybackEvent),
+    {
+        let (_control_tx, control_rx) = mpsc::channel();
+        self.play_controlled(track, control_rx, on_event)
+    }
+
+    pub fn play_controlled<F>(
+        &self,
+        track: &Track,
+        control_rx: Receiver<PlaybackControl>,
+        mut on_event: F,
+    ) -> Result<()>
     where
         F: FnMut(PlaybackEvent),
     {
@@ -68,6 +101,7 @@ impl PlaybackEngine {
         let queued_samples = Arc::new(AtomicI64::new(0));
         let decoder_done = Arc::new(AtomicBool::new(false));
         let decoder_error = Arc::new(Mutex::new(None::<String>));
+        let stop_requested = Arc::new(AtomicBool::new(false));
 
         let output = SharedOutput::open(&stream_info, sample_rx, queued_samples.clone())?;
         for warning in output.info().warnings.clone() {
@@ -78,6 +112,7 @@ impl PlaybackEngine {
         let decoder_done_for_thread = decoder_done.clone();
         let decoder_error_for_thread = decoder_error.clone();
         let queued_for_thread = queued_samples.clone();
+        let stop_for_thread = stop_requested.clone();
         let output_sample_rate = output.info().sample_rate;
         let decoder_handle = thread::Builder::new()
             .name("echo-cli-decoder".to_string())
@@ -87,6 +122,7 @@ impl PlaybackEngine {
                     sample_tx,
                     queued_for_thread,
                     output_sample_rate,
+                    stop_for_thread,
                 ) && let Ok(mut slot) = decoder_error_for_thread.lock()
                 {
                     *slot = Some(error.to_string());
@@ -103,7 +139,38 @@ impl PlaybackEngine {
             output: output.info().clone(),
         });
 
+        let mut paused = false;
+        let mut stopped = false;
         while !decoder_done.load(Ordering::Acquire) || queued_samples.load(Ordering::Acquire) > 0 {
+            while let Ok(control) = control_rx.try_recv() {
+                match control {
+                    PlaybackControl::Pause if !paused => {
+                        output.pause()?;
+                        paused = true;
+                        on_event(PlaybackEvent::Paused {
+                            title: track.title.clone(),
+                        });
+                    }
+                    PlaybackControl::Resume if paused => {
+                        output.play()?;
+                        paused = false;
+                        on_event(PlaybackEvent::Resumed {
+                            title: track.title.clone(),
+                        });
+                    }
+                    PlaybackControl::Stop => {
+                        stop_requested.store(true, Ordering::Release);
+                        stopped = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            if stopped {
+                break;
+            }
+
             thread::sleep(Duration::from_millis(30));
         }
 
@@ -112,6 +179,14 @@ impl PlaybackEngine {
         decoder_handle
             .join()
             .map_err(|_| EchoError::Playback("decoder thread panicked".to_string()))?;
+
+        if stopped {
+            on_event(PlaybackEvent::Stopped {
+                title: track.title.clone(),
+                elapsed_ms: started.elapsed().as_millis(),
+            });
+            return Ok(());
+        }
 
         if let Some(message) = decoder_error.lock().ok().and_then(|mut slot| slot.take()) {
             on_event(PlaybackEvent::Error {

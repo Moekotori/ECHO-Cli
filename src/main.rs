@@ -12,7 +12,7 @@ mod metadata;
 mod playback;
 mod scanner;
 mod search;
-mod tui;
+mod shell;
 
 use clap::Parser;
 use commands::Cli;

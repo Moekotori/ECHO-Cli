@@ -1,8 +1,11 @@
 use crate::error::{EchoError, Result};
 use std::fs::File;
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, mpsc::SyncSender};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{
+    Arc,
+    mpsc::{SyncSender, TrySendError},
+};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
@@ -55,6 +58,7 @@ pub fn decode_to_channel(
     sample_tx: SyncSender<Vec<f32>>,
     queued_samples: Arc<AtomicI64>,
     target_sample_rate: u32,
+    stop_requested: Arc<AtomicBool>,
 ) -> Result<()> {
     let source = File::open(path)?;
     let media_source = MediaSourceStream::new(Box::new(source), Default::default());
@@ -106,6 +110,10 @@ pub fn decode_to_channel(
         .map_err(|error| decode_error(path, error))?;
 
     loop {
+        if stop_requested.load(Ordering::Acquire) {
+            break;
+        }
+
         let packet = match format.next_packet() {
             Ok(packet) => packet,
             Err(SymphoniaError::IoError(error))
@@ -145,15 +153,40 @@ pub fn decode_to_channel(
             continue;
         }
 
-        let sample_count = samples.len() as i64;
-        queued_samples.fetch_add(sample_count, Ordering::Release);
-        if sample_tx.send(samples).is_err() {
-            queued_samples.fetch_sub(sample_count, Ordering::Release);
-            return Ok(());
-        }
+        send_samples(samples, &sample_tx, &queued_samples, &stop_requested)?;
     }
 
     Ok(())
+}
+
+fn send_samples(
+    samples: Vec<f32>,
+    sample_tx: &SyncSender<Vec<f32>>,
+    queued_samples: &AtomicI64,
+    stop_requested: &AtomicBool,
+) -> Result<()> {
+    let sample_count = samples.len() as i64;
+    queued_samples.fetch_add(sample_count, Ordering::Release);
+    let mut pending = samples;
+
+    loop {
+        if stop_requested.load(Ordering::Acquire) {
+            queued_samples.fetch_sub(sample_count, Ordering::Release);
+            return Ok(());
+        }
+
+        match sample_tx.try_send(pending) {
+            Ok(()) => return Ok(()),
+            Err(TrySendError::Full(samples)) => {
+                pending = samples;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                queued_samples.fetch_sub(sample_count, Ordering::Release);
+                return Ok(());
+            }
+        }
+    }
 }
 
 fn stream_info_from_params(

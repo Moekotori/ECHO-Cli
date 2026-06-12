@@ -85,6 +85,12 @@ impl SharedOutput {
             .map_err(|error| EchoError::Audio(error.to_string()))
     }
 
+    pub fn pause(&self) -> Result<()> {
+        self.stream
+            .pause()
+            .map_err(|error| EchoError::Audio(error.to_string()))
+    }
+
     pub fn info(&self) -> &OutputStreamInfo {
         &self.info
     }

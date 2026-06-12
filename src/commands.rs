@@ -9,7 +9,7 @@ use crate::metadata;
 use crate::playback::{PlaybackEngine, PlaybackEvent};
 use crate::scanner;
 use crate::search;
-use crate::tui;
+use crate::shell;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -24,8 +24,9 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Open the terminal UI.
-    Tui,
+    /// Open the interactive ECHO shell.
+    #[command(visible_alias = "tui")]
+    Shell,
     /// Scan a music folder into the local library database.
     Scan { folder: PathBuf },
     /// Search the indexed library.
@@ -43,10 +44,10 @@ pub enum Command {
 }
 
 pub fn run(cli: Cli) -> Result<()> {
-    match cli.command.unwrap_or(Command::Tui) {
-        Command::Tui => {
+    match cli.command.unwrap_or(Command::Shell) {
+        Command::Shell => {
             let paths = AppPaths::load()?;
-            tui::run(&paths)
+            shell::run(&paths)
         }
         Command::Scan { folder } => run_scan(folder),
         Command::Search { query } => run_search(&query),
@@ -244,6 +245,15 @@ fn print_playback_event(event: &PlaybackEvent) {
         PlaybackEvent::Warning(message) => {
             println!("  warning  {message}");
         }
+        PlaybackEvent::Paused { .. } => {
+            println!("  status   paused");
+        }
+        PlaybackEvent::Resumed { .. } => {
+            println!("  status   playing");
+        }
+        PlaybackEvent::Stopped { elapsed_ms, .. } => {
+            println!("  status   stopped in {} ms", elapsed_ms);
+        }
         PlaybackEvent::Finished { elapsed_ms, .. } => {
             println!("  status   finished in {} ms", elapsed_ms);
         }
@@ -283,6 +293,8 @@ mod tests {
     #[test]
     fn command_parser_accepts_required_phase1_commands() {
         Cli::command().debug_assert();
+        Cli::try_parse_from(["echo-cli", "shell"]).unwrap();
+        Cli::try_parse_from(["echo-cli", "tui"]).unwrap();
         Cli::try_parse_from(["echo-cli", "scan", "C:/Music"]).unwrap();
         Cli::try_parse_from(["echo-cli", "search", "moon"]).unwrap();
         Cli::try_parse_from(["echo-cli", "doctor"]).unwrap();
