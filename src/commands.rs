@@ -5,6 +5,8 @@ use crate::config::AppPaths;
 use crate::db::Database;
 use crate::device;
 use crate::error::Result;
+use crate::metadata;
+use crate::playback::{PlaybackEngine, PlaybackEvent};
 use crate::scanner;
 use crate::search;
 use crate::tui;
@@ -28,7 +30,7 @@ pub enum Command {
     Scan { folder: PathBuf },
     /// Search the indexed library.
     Search { query: String },
-    /// Play a path or indexed search result. Playback arrives in Phase 2.
+    /// Play a path or indexed search result.
     Play { query_or_path: String },
     /// List audio devices. Real WASAPI enumeration arrives in Phase 4.
     Devices,
@@ -44,7 +46,7 @@ pub fn run(cli: Cli) -> Result<()> {
     match cli.command.unwrap_or(Command::Tui) {
         Command::Tui => {
             let paths = AppPaths::load()?;
-            tui::run_phase1_preview(&paths)
+            tui::run(&paths)
         }
         Command::Scan { folder } => run_scan(folder),
         Command::Search { query } => run_search(&query),
@@ -106,22 +108,10 @@ fn run_search(query: &str) -> Result<()> {
 fn run_play(query_or_path: &str) -> Result<()> {
     let paths = AppPaths::load()?;
     let database = Database::open(paths.database_path())?;
-    let as_path = PathBuf::from(query_or_path);
+    let track = resolve_play_target(&database, query_or_path)?;
+    let engine = PlaybackEngine::new();
 
-    if let Some(track) = database.find_exact_path(&as_path)? {
-        println!("queued for Phase 2 playback: {}", track.title);
-        println!("{}", track.path);
-        return Ok(());
-    }
-
-    let results = search::search(&database, query_or_path, 1)?;
-    if let Some(result) = results.first() {
-        println!("queued for Phase 2 playback: {}", result.track.title);
-        println!("{}", result.track.path);
-    } else {
-        println!("no playable match for: {query_or_path}");
-    }
-    Ok(())
+    engine.play_blocking(&track, |event| print_playback_event(&event))
 }
 
 fn run_devices() -> Result<()> {
@@ -140,7 +130,7 @@ fn run_devices() -> Result<()> {
 
 fn run_use_device(device_id_or_name: &str) -> Result<()> {
     println!("device preference is a Phase 4 feature: {device_id_or_name}");
-    println!("WASAPI device switching is intentionally not wired in Phase 1.");
+    println!("WASAPI device switching is intentionally not wired in Phase 3.");
     Ok(())
 }
 
@@ -164,6 +154,18 @@ fn run_doctor() -> Result<()> {
         audio_backend_wasapi::exclusive_status_line()
     );
     println!("  default output device  {}", device::default_device_name());
+    println!("  available devices");
+    for audio_device in device::list_devices() {
+        println!(
+            "    - {}{}",
+            audio_device.name,
+            if audio_device.is_default {
+                " (default)"
+            } else {
+                ""
+            }
+        );
+    }
     println!(
         "  database path          {}",
         paths.database_path().display()
@@ -186,6 +188,77 @@ fn run_doctor() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn resolve_play_target(database: &Database, query_or_path: &str) -> Result<crate::library::Track> {
+    let as_path = PathBuf::from(query_or_path);
+    if as_path.exists() {
+        let metadata = std::fs::metadata(&as_path)?;
+        return metadata::read_track(&as_path, &metadata)
+            .or_else(|_| metadata::fallback_track(&as_path, &metadata));
+    }
+
+    if let Some(track) = database.find_exact_path(&as_path)? {
+        return Ok(track);
+    }
+
+    let results = search::search(database, query_or_path, 1)?;
+    results
+        .into_iter()
+        .next()
+        .map(|result| result.track)
+        .ok_or_else(|| {
+            crate::error::EchoError::Playback(format!("no playable match for: {query_or_path}"))
+        })
+}
+
+fn print_playback_event(event: &PlaybackEvent) {
+    match event {
+        PlaybackEvent::Loading { title, path } => {
+            println!("ECHO  playing");
+            println!("  track    {title}");
+            println!("  source   {path}");
+            println!("  status   decoding...");
+        }
+        PlaybackEvent::Playing { stream, output, .. } => {
+            println!("  output   {} / {}", output.device_name, output.mode);
+            println!(
+                "  format   {} Hz / {}ch / {}",
+                output.sample_rate, output.channel_count, output.sample_format
+            );
+            println!("  buffer   {}", output.buffer_size);
+            println!(
+                "  source   {} Hz / {}ch{}",
+                stream.sample_rate,
+                stream.channel_count,
+                stream
+                    .bit_depth
+                    .map(|bits| format!(" / {bits}-bit"))
+                    .unwrap_or_default()
+            );
+            if let Some(duration_ms) = stream.duration_ms {
+                println!("  length   {}", format_duration(duration_ms));
+            }
+            println!("  status   playing");
+        }
+        PlaybackEvent::Warning(message) => {
+            println!("  warning  {message}");
+        }
+        PlaybackEvent::Finished { elapsed_ms, .. } => {
+            println!("  status   finished in {} ms", elapsed_ms);
+        }
+        PlaybackEvent::Error { message, .. } => {
+            println!("  status   failed");
+            println!("  error    {message}");
+        }
+    }
+}
+
+fn format_duration(duration_ms: u64) -> String {
+    let total_seconds = duration_ms / 1000;
+    let minutes = total_seconds / 60;
+    let seconds = total_seconds % 60;
+    format!("{minutes}:{seconds:02}")
 }
 
 fn truncate(value: &str, width: usize) -> String {

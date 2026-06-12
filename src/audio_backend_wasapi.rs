@@ -1,6 +1,6 @@
 pub fn exclusive_status_line() -> &'static str {
     if cfg!(windows) {
-        "planned, not enabled in Phase 1"
+        "planned for Phase 4; Phase 2 uses shared output"
     } else {
         "unavailable on this platform"
     }
