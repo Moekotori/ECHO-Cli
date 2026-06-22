@@ -26,12 +26,12 @@ Implemented:
   result-aware `play` and `search` completion, typo recovery, next-step tips,
   history, Tab/Enter completion, search results, playback controls, and
   folder-picker scanning
+- session playback queue, automatic next-track advance, and `seek` controls
 - focused tests for scanner filtering, metadata fallback, search ranking,
   database updates, command parsing, channel mapping, and shell helpers
 
 Not implemented yet:
 
-- persistent pause/seek/queue workflow polish
 - WASAPI device switching and exclusive mode
 
 ## Quick start
@@ -48,7 +48,7 @@ First run:
 
 1. Type `scan` or `add` to choose a music folder with the Windows folder picker.
 2. After tracks appear, type `1`, `play`, `play 1`, or `shuffle`.
-3. During playback, type `pause`, `resume`, `stop`, `next`, `prev`, `now`, or `quit`.
+3. During playback, type `pause`, `resume`, `stop`, `seek +10`, `queue`, `next`, `prev`, `now`, or `quit`.
 4. Press Enter on an empty prompt, or type `tips`, whenever you are unsure what to do next.
 5. Press `Tab` on an empty prompt to accept the first suggested command.
 
@@ -87,6 +87,10 @@ Inside the shell:
 
 - Press `?` or type `help` / `commands` for help.
 - Slash commands also work: `/help`, `/home`, `/scan`, `/search`, `/play`, `/pause`, `/status`, and `/quit`.
+- Type `/volume 65`, `volume +5`, or `volume mute` to control ECHO playback volume from 0 to 100.
+- Type `meter`, `tokens`, `now`, or `status` during playback to see elapsed/remaining time, queue position, queue time remaining, seek undo position, up-next track, and simulated token/cost tracking. This is local UI only and never billed.
+- Type `seek 1:30`, `seek 50%`, `seek +10%`, `seek undo`, `seek start`, `seek end`, `seek +10`, or `seek -10` to jump within the current track or return to the position before the last seek.
+- Type `queue`, `queue all`, `queue undo`, `queue shuffle`, `queue reverse`, `queue dedupe`, `queue next 5`, `queue add 5`, `queue move 5 2`, `queue remove 4`, `queue 5`, `up next`, or `queue clear` to inspect known queued duration, expand, undo edits, shuffle/reverse upcoming tracks, remove duplicates, play next, append to, reorder, remove from, jump within, or trim the session playback queue.
 - Type `/language`, `/language zh`, or `/language en` to switch the shell guide language; ECHO redraws the guide immediately. Use `/language status` or `/language list` to inspect it.
 - Chinese command aliases are available too: `帮助`, `扫描`, `搜索 moon`, `播放 1`, `暂停`, `继续`, `停止`, `退出`.
 - Type `aliases` to see alternate command names.
@@ -95,8 +99,9 @@ Inside the shell:
 - If scanning reports failed files, type `errors` to inspect the recent failures.
 - After scanning, ECHO lists numbered tracks; type `1`, `play 1`, or just `play`.
 - Type `next` or `prev` to move through the current search/list results.
+- Playing from visible results makes that result list the active session queue; a natural track finish advances to the next queued song.
 - Type `play #3`, `play next`, or `play prev` if that feels more natural.
-- Type `shuffle`, `surprise`, or `play random` to play a random visible result.
+- Type `shuffle`, `surprise`, or `play random` to play a random track from the active queue or current results.
 - Type `list`, `recent`, `songs`, or `tracks` to show the current library list again.
 - Type `results` to print the current search/list results again without resetting them.
 - Type `more` to expand the current search/list results beyond the first 20.
@@ -125,7 +130,7 @@ Inside the shell:
 - Type `home` to show the welcome screen and current library view again.
 - Type `help play`, `help search`, or `help scan` for focused command help.
 - Type `again` to repeat the last command.
-- During playback, the prompt stays usable; type `pause`, `resume`, `stop`, `shuffle`, `play next`, `play prev`, or `quit`.
+- During playback, the prompt stays usable and shows elapsed time, queue position when useful, and simulated token cost; type `pause`, `resume`, `stop`, `volume 65`, `volume +5`, `seek +10`, `queue`, `meter`, `shuffle`, `play next`, `play prev`, or `quit`.
 - Type `q` or `exit` if your fingers prefer shorter exits.
 - If a command is mistyped, ECHO suggests the closest commands instead of leaving you stuck.
 - Type `status`, `health` / `doctor`, `devices` / `outputs`, `errors`, or `open-db` for shell diagnostics.

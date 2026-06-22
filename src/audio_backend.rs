@@ -1,10 +1,10 @@
-use crate::decoder::DecodeStreamInfo;
+use crate::decoder::{DecodeStreamInfo, SampleChunk};
 use crate::error::{EchoError, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, SampleRate, Stream, StreamConfig, SupportedStreamConfig};
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,13 +21,16 @@ pub struct OutputStreamInfo {
 pub struct SharedOutput {
     stream: Stream,
     info: OutputStreamInfo,
+    volume_percent: Arc<AtomicU32>,
+    current_generation: Arc<AtomicU64>,
 }
 
 impl SharedOutput {
-    pub fn open(
+    pub fn open_with_volume(
         stream_info: &DecodeStreamInfo,
-        sample_rx: Receiver<Vec<f32>>,
+        sample_rx: Receiver<SampleChunk>,
         queued_samples: Arc<AtomicI64>,
+        initial_volume_percent: u8,
     ) -> Result<Self> {
         let host = cpal::default_host();
         let device = host
@@ -64,6 +67,8 @@ impl SharedOutput {
             warnings,
         };
 
+        let volume_percent = Arc::new(AtomicU32::new(initial_volume_percent.min(100) as u32));
+        let current_generation = Arc::new(AtomicU64::new(0));
         let stream = build_stream(
             &device,
             &config,
@@ -71,11 +76,15 @@ impl SharedOutput {
             stream_info.channel_count,
             sample_rx,
             queued_samples,
+            volume_percent.clone(),
+            current_generation.clone(),
         )?;
 
         Ok(Self {
             stream,
             info: output_info,
+            volume_percent,
+            current_generation,
         })
     }
 
@@ -89,6 +98,15 @@ impl SharedOutput {
         self.stream
             .pause()
             .map_err(|error| EchoError::Audio(error.to_string()))
+    }
+
+    pub fn set_volume_percent(&self, percent: u8) {
+        self.volume_percent
+            .store(percent.min(100) as u32, Ordering::Relaxed);
+    }
+
+    pub fn set_generation(&self, generation: u64) {
+        self.current_generation.store(generation, Ordering::Release);
     }
 
     pub fn info(&self) -> &OutputStreamInfo {
@@ -153,8 +171,10 @@ fn build_stream(
     config: &StreamConfig,
     sample_format: SampleFormat,
     source_channels: u16,
-    sample_rx: Receiver<Vec<f32>>,
+    sample_rx: Receiver<SampleChunk>,
     queued_samples: Arc<AtomicI64>,
+    volume_percent: Arc<AtomicU32>,
+    current_generation: Arc<AtomicU64>,
 ) -> Result<Stream> {
     match sample_format {
         SampleFormat::F32 => build_typed_stream::<f32>(
@@ -163,6 +183,8 @@ fn build_stream(
             source_channels,
             sample_rx,
             queued_samples,
+            volume_percent,
+            current_generation,
             write_f32,
         ),
         SampleFormat::I16 => build_typed_stream::<i16>(
@@ -171,6 +193,8 @@ fn build_stream(
             source_channels,
             sample_rx,
             queued_samples,
+            volume_percent,
+            current_generation,
             write_i16,
         ),
         SampleFormat::U16 => build_typed_stream::<u16>(
@@ -179,6 +203,8 @@ fn build_stream(
             source_channels,
             sample_rx,
             queued_samples,
+            volume_percent,
+            current_generation,
             write_u16,
         ),
         other => Err(EchoError::Audio(format!(
@@ -191,16 +217,24 @@ fn build_typed_stream<T>(
     device: &cpal::Device,
     config: &StreamConfig,
     source_channels: u16,
-    sample_rx: Receiver<Vec<f32>>,
+    sample_rx: Receiver<SampleChunk>,
     queued_samples: Arc<AtomicI64>,
+    volume_percent: Arc<AtomicU32>,
+    current_generation: Arc<AtomicU64>,
     write_sample: fn(&mut T, f32),
 ) -> Result<Stream>
 where
     T: cpal::SizedSample + 'static,
 {
     let output_channels = config.channels;
-    let mut mapper =
-        ChannelMapper::new(source_channels, output_channels, sample_rx, queued_samples);
+    let mut mapper = ChannelMapper::new(
+        source_channels,
+        output_channels,
+        sample_rx,
+        queued_samples,
+        volume_percent,
+        current_generation,
+    );
     device
         .build_output_stream(
             config,
@@ -214,18 +248,23 @@ where
 struct ChannelMapper {
     source_channels: u16,
     output_channels: u16,
-    sample_rx: Receiver<Vec<f32>>,
+    sample_rx: Receiver<SampleChunk>,
     scratch: VecDeque<f32>,
     frame: Vec<f32>,
     queued_samples: Arc<AtomicI64>,
+    volume_percent: Arc<AtomicU32>,
+    current_generation: Arc<AtomicU64>,
+    generation: u64,
 }
 
 impl ChannelMapper {
     fn new(
         source_channels: u16,
         output_channels: u16,
-        sample_rx: Receiver<Vec<f32>>,
+        sample_rx: Receiver<SampleChunk>,
         queued_samples: Arc<AtomicI64>,
+        volume_percent: Arc<AtomicU32>,
+        current_generation: Arc<AtomicU64>,
     ) -> Self {
         Self {
             source_channels,
@@ -234,10 +273,15 @@ impl ChannelMapper {
             scratch: VecDeque::new(),
             frame: Vec::with_capacity(source_channels as usize),
             queued_samples,
+            volume_percent,
+            current_generation,
+            generation: 0,
         }
     }
 
     fn write_output<T>(&mut self, output: &mut [T], write_sample: fn(&mut T, f32)) {
+        self.sync_generation();
+        let volume = volume_factor(self.volume_percent.load(Ordering::Relaxed));
         for output_frame in output.chunks_mut(self.output_channels as usize) {
             self.frame.clear();
             for _ in 0..self.source_channels {
@@ -247,7 +291,7 @@ impl ChannelMapper {
 
             let mapped = map_frame(&self.frame, self.output_channels);
             for (sample, value) in output_frame.iter_mut().zip(mapped) {
-                write_sample(sample, value);
+                write_sample(sample, value * volume);
             }
         }
     }
@@ -255,7 +299,13 @@ impl ChannelMapper {
     fn pop_sample(&mut self) -> Option<f32> {
         while self.scratch.is_empty() {
             match self.sample_rx.try_recv() {
-                Ok(samples) => self.scratch.extend(samples),
+                Ok(chunk) if chunk.generation == self.generation => {
+                    self.scratch.extend(chunk.samples)
+                }
+                Ok(chunk) => {
+                    self.queued_samples
+                        .fetch_sub(chunk.samples.len() as i64, Ordering::Release);
+                }
                 Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => return None,
             }
         }
@@ -265,6 +315,37 @@ impl ChannelMapper {
             self.queued_samples.fetch_sub(1, Ordering::Release);
         }
         sample
+    }
+
+    fn sync_generation(&mut self) {
+        let current_generation = self.current_generation.load(Ordering::Acquire);
+        if current_generation == self.generation {
+            return;
+        }
+
+        if !self.scratch.is_empty() {
+            self.queued_samples
+                .fetch_sub(self.scratch.len() as i64, Ordering::Release);
+            self.scratch.clear();
+        }
+        self.generation = current_generation;
+        self.discard_stale_chunks_until_current();
+    }
+
+    fn discard_stale_chunks_until_current(&mut self) {
+        loop {
+            match self.sample_rx.try_recv() {
+                Ok(chunk) if chunk.generation == self.generation => {
+                    self.scratch.extend(chunk.samples);
+                    return;
+                }
+                Ok(chunk) => {
+                    self.queued_samples
+                        .fetch_sub(chunk.samples.len() as i64, Ordering::Release);
+                }
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => return,
+            }
+        }
     }
 }
 
@@ -291,6 +372,10 @@ fn map_frame(frame: &[f32], output_channels: u16) -> Vec<f32> {
     (0..output_channels)
         .map(|index| frame.get(index).copied().unwrap_or(0.0))
         .collect()
+}
+
+fn volume_factor(percent: u32) -> f32 {
+    percent.min(100) as f32 / 100.0
 }
 
 fn write_f32(output: &mut f32, sample: f32) {
@@ -322,5 +407,93 @@ mod tests {
     #[test]
     fn extra_output_channels_are_silent() {
         assert_eq!(map_frame(&[0.1, 0.2], 4), vec![0.1, 0.2, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn volume_factor_clamps_to_percent_range() {
+        assert_eq!(volume_factor(0), 0.0);
+        assert_eq!(volume_factor(50), 0.5);
+        assert_eq!(volume_factor(100), 1.0);
+        assert_eq!(volume_factor(150), 1.0);
+    }
+
+    #[test]
+    fn mapper_discards_stale_generation_and_keeps_volume() {
+        let (sample_tx, sample_rx) = std::sync::mpsc::channel();
+        let queued_samples = Arc::new(AtomicI64::new(4));
+        let volume_percent = Arc::new(AtomicU32::new(50));
+        let current_generation = Arc::new(AtomicU64::new(1));
+        sample_tx
+            .send(SampleChunk {
+                generation: 0,
+                samples: vec![1.0, 1.0],
+            })
+            .unwrap();
+        sample_tx
+            .send(SampleChunk {
+                generation: 1,
+                samples: vec![0.4, 0.8],
+            })
+            .unwrap();
+
+        let mut mapper = ChannelMapper::new(
+            1,
+            1,
+            sample_rx,
+            queued_samples.clone(),
+            volume_percent,
+            current_generation,
+        );
+        let mut output = [0.0_f32; 2];
+        mapper.write_output(&mut output, write_f32);
+
+        assert_eq!(output, [0.2, 0.4]);
+        assert_eq!(queued_samples.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn generation_switch_releases_stale_queued_chunks_without_dropping_current() {
+        let (sample_tx, sample_rx) = std::sync::mpsc::channel();
+        let queued_samples = Arc::new(AtomicI64::new(6));
+        let volume_percent = Arc::new(AtomicU32::new(100));
+        let current_generation = Arc::new(AtomicU64::new(1));
+        sample_tx
+            .send(SampleChunk {
+                generation: 0,
+                samples: vec![1.0, 1.0],
+            })
+            .unwrap();
+        sample_tx
+            .send(SampleChunk {
+                generation: 0,
+                samples: vec![0.5, 0.5],
+            })
+            .unwrap();
+        sample_tx
+            .send(SampleChunk {
+                generation: 1,
+                samples: vec![0.25, 0.75],
+            })
+            .unwrap();
+
+        let mut mapper = ChannelMapper::new(
+            1,
+            1,
+            sample_rx,
+            queued_samples.clone(),
+            volume_percent,
+            current_generation,
+        );
+
+        mapper.write_output(&mut [], write_f32);
+
+        assert_eq!(queued_samples.load(Ordering::Acquire), 2);
+        assert_eq!(mapper.scratch.len(), 2);
+
+        let mut output = [0.0_f32; 2];
+        mapper.write_output(&mut output, write_f32);
+
+        assert_eq!(output, [0.25, 0.75]);
+        assert_eq!(queued_samples.load(Ordering::Acquire), 0);
     }
 }

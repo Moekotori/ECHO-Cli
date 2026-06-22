@@ -251,6 +251,9 @@ fn print_playback_event(event: &PlaybackEvent) {
         PlaybackEvent::Resumed { .. } => {
             println!("  status   playing");
         }
+        PlaybackEvent::Seeked { position_ms, .. } => {
+            println!("  status   seeked to {}", format_duration(*position_ms));
+        }
         PlaybackEvent::Stopped { elapsed_ms, .. } => {
             println!("  status   stopped in {} ms", elapsed_ms);
         }
