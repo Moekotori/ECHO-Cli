@@ -19,7 +19,7 @@ Implemented:
 - search ranking for title, artist, album, filename, and path
 - `shell`, `scan`, `search`, `doctor`, `devices`, `play`, and `version` commands
 - Symphonia-based streaming decode for local playback
-- CPAL shared-mode output on the system default output device
+- CPAL shared-mode output on the system default or saved output device
 - bounded decoder-to-output buffer
 - typed playback events feeding CLI and shell status updates
 - Shell-style REPL with a stateful prompt, live command suggestions,
@@ -32,7 +32,7 @@ Implemented:
 
 Not implemented yet:
 
-- WASAPI device switching and exclusive mode
+- WASAPI exclusive mode
 
 ## Quick start
 
@@ -43,6 +43,8 @@ cargo run --
 Launching `echo-cli` without a subcommand opens the ECHO shell. The shell is the
 main experience: it keeps a normal terminal scrollback, shows command
 suggestions as you type, and keeps accepting commands while music is playing.
+The first screen stays compact; type `library`, `list`, or `recent` when you
+want to print the full library table.
 
 First run:
 
@@ -75,6 +77,7 @@ cargo run -- scan "D:\Music"
 cargo run -- search "moon"
 cargo run -- doctor
 cargo run -- devices
+cargo run -- use-device "Speakers"
 cargo run -- play "D:\Music\song.flac"
 cargo run -- shell
 ```
@@ -88,6 +91,7 @@ Inside the shell:
 - Press `?` or type `help` / `commands` for help.
 - Slash commands also work: `/help`, `/home`, `/scan`, `/search`, `/play`, `/pause`, `/status`, and `/quit`.
 - Type `/volume 65`, `volume +5`, or `volume mute` to control ECHO playback volume from 0 to 100.
+- Type `devices` to list output devices, `device <id-or-name>` / `output <id-or-name>` to save a shared-mode output device for future playback, or `device default` to return to the system default device.
 - Type `meter`, `tokens`, `now`, or `status` during playback to see elapsed/remaining time, queue position, queue time remaining, seek undo position, up-next track, and simulated token/cost tracking. This is local UI only and never billed.
 - Type `seek 1:30`, `seek 50%`, `seek +10%`, `seek undo`, `seek start`, `seek end`, `seek +10`, or `seek -10` to jump within the current track or return to the position before the last seek.
 - Type `queue`, `queue all`, `queue undo`, `queue shuffle`, `queue reverse`, `queue dedupe`, `queue next 5`, `queue add 5`, `queue move 5 2`, `queue remove 4`, `queue 5`, `up next`, or `queue clear` to inspect known queued duration, expand, undo edits, shuffle/reverse upcoming tracks, remove duplicates, play next, append to, reorder, remove from, jump within, or trim the session playback queue.
@@ -133,7 +137,7 @@ Inside the shell:
 - During playback, the prompt stays usable and shows elapsed time, queue position when useful, and simulated token cost; type `pause`, `resume`, `stop`, `volume 65`, `volume +5`, `seek +10`, `queue`, `meter`, `shuffle`, `play next`, `play prev`, or `quit`.
 - Type `q` or `exit` if your fingers prefer shorter exits.
 - If a command is mistyped, ECHO suggests the closest commands instead of leaving you stuck.
-- Type `status`, `health` / `doctor`, `devices` / `outputs`, `errors`, or `open-db` for shell diagnostics.
+- Type `status`, `health` / `doctor`, `devices` / `outputs`, `device default`, `errors`, or `open-db` for shell diagnostics and output routing.
 
 ## Design rules
 

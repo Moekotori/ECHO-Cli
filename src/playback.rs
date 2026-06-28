@@ -78,31 +78,31 @@ impl PlaybackEngine {
         Self
     }
 
-    pub fn play_blocking<F>(&self, track: &Track, on_event: F) -> Result<()>
-    where
-        F: FnMut(PlaybackEvent),
-    {
-        let (_control_tx, control_rx) = mpsc::channel();
-        self.play_controlled(track, control_rx, on_event)
-    }
-
-    pub fn play_controlled<F>(
+    pub fn play_blocking_with_output_device<F>(
         &self,
         track: &Track,
-        control_rx: Receiver<PlaybackControl>,
+        output_device_selector: Option<&str>,
         on_event: F,
     ) -> Result<()>
     where
         F: FnMut(PlaybackEvent),
     {
-        self.play_controlled_with_volume(track, control_rx, 100, on_event)
+        let (_control_tx, control_rx) = mpsc::channel();
+        self.play_controlled_with_volume_and_device(
+            track,
+            control_rx,
+            100,
+            output_device_selector,
+            on_event,
+        )
     }
 
-    pub fn play_controlled_with_volume<F>(
+    pub fn play_controlled_with_volume_and_device<F>(
         &self,
         track: &Track,
         control_rx: Receiver<PlaybackControl>,
         initial_volume_percent: u8,
+        output_device_selector: Option<&str>,
         mut on_event: F,
     ) -> Result<()>
     where
@@ -125,11 +125,12 @@ impl PlaybackEngine {
         let stop_requested = Arc::new(AtomicBool::new(false));
         let requested_generation = Arc::new(AtomicU64::new(0));
 
-        let output = SharedOutput::open_with_volume(
+        let output = SharedOutput::open_with_volume_on_device(
             &stream_info,
             sample_rx,
             queued_samples.clone(),
             initial_volume_percent,
+            output_device_selector,
         )?;
         for warning in output.info().warnings.clone() {
             on_event(PlaybackEvent::Warning(warning));

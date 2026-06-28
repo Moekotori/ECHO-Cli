@@ -33,9 +33,9 @@ pub enum Command {
     Search { query: String },
     /// Play a path or indexed search result.
     Play { query_or_path: String },
-    /// List audio devices. Real WASAPI enumeration arrives in Phase 4.
+    /// List audio output devices.
     Devices,
-    /// Save the preferred output device. Real switching arrives in Phase 4.
+    /// Save the preferred shared-mode output device.
     UseDevice { device_id_or_name: String },
     /// Print runtime, database, and audio backend diagnostics.
     Doctor,
@@ -109,15 +109,24 @@ fn run_search(query: &str) -> Result<()> {
 fn run_play(query_or_path: &str) -> Result<()> {
     let paths = AppPaths::load()?;
     let database = Database::open(paths.database_path())?;
+    let output_device_preference = paths.load_output_device_preference()?;
     let track = resolve_play_target(&database, query_or_path)?;
     let engine = PlaybackEngine::new();
 
-    engine.play_blocking(&track, |event| print_playback_event(&event))
+    engine.play_blocking_with_output_device(&track, output_device_preference.as_deref(), |event| {
+        print_playback_event(&event)
+    })
 }
 
 fn run_devices() -> Result<()> {
+    let paths = AppPaths::load()?;
+    let preference = paths.load_output_device_preference()?;
     let devices = device::list_devices();
     println!("ECHO CLI  devices");
+    println!(
+        "selected  {}",
+        preference.as_deref().unwrap_or("system default")
+    );
     for device in devices {
         println!(
             "- {} [{}] {}",
@@ -130,8 +139,19 @@ fn run_devices() -> Result<()> {
 }
 
 fn run_use_device(device_id_or_name: &str) -> Result<()> {
-    println!("device preference is a Phase 4 feature: {device_id_or_name}");
-    println!("WASAPI device switching is intentionally not wired in Phase 3.");
+    let paths = AppPaths::load()?;
+    if device::is_default_output_selector(device_id_or_name) {
+        paths.save_output_device_preference(None)?;
+        println!("output device preference cleared; using system default");
+        return Ok(());
+    }
+
+    let selected = device::selected_output_device(Some(device_id_or_name))?;
+    paths.save_output_device_preference(Some(&selected.info.name))?;
+    println!("output device saved");
+    println!("  device  {}", selected.info.name);
+    println!("  mode    shared");
+    println!("  note    WASAPI exclusive is still not enabled");
     Ok(())
 }
 
@@ -155,6 +175,12 @@ fn run_doctor() -> Result<()> {
         audio_backend_wasapi::exclusive_status_line()
     );
     println!("  default output device  {}", device::default_device_name());
+    println!(
+        "  selected output        {}",
+        paths
+            .load_output_device_preference()?
+            .unwrap_or_else(|| "system default".to_string())
+    );
     println!("  available devices");
     for audio_device in device::list_devices() {
         println!(
@@ -302,5 +328,6 @@ mod tests {
         Cli::try_parse_from(["echo-cli", "search", "moon"]).unwrap();
         Cli::try_parse_from(["echo-cli", "doctor"]).unwrap();
         Cli::try_parse_from(["echo-cli", "devices"]).unwrap();
+        Cli::try_parse_from(["echo-cli", "use-device", "Speakers"]).unwrap();
     }
 }

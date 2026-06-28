@@ -55,6 +55,7 @@ struct EchoShell {
     active_queue: ActiveQueue,
     queue_undo: Option<ActiveQueue>,
     volume_percent: u8,
+    output_device_preference: Option<String>,
     last_command: Option<String>,
     language: ShellLanguage,
 }
@@ -489,6 +490,7 @@ impl EchoShell {
     fn new(paths: AppPaths, database: Database) -> Result<Self> {
         let (results, has_more_results) = load_result_window(&database, "", RESULT_LIMIT)?;
         let language = load_language(&paths);
+        let output_device_preference = paths.load_output_device_preference()?;
         Ok(Self {
             paths,
             database,
@@ -502,6 +504,7 @@ impl EchoShell {
             active_queue: ActiveQueue::empty(),
             queue_undo: None,
             volume_percent: DEFAULT_VOLUME_PERCENT,
+            output_device_preference,
             last_command: None,
             language,
         })
@@ -587,30 +590,13 @@ impl EchoShell {
 
     fn print_welcome(&mut self) -> Result<()> {
         let track_count = self.database.track_count()?;
+        let output_device = selected_output_device_label(self.output_device_preference.as_deref());
         print_welcome_card_lines(&welcome_card_lines(
             track_count,
-            &device::default_device_name(),
+            &output_device,
             self.language,
             terminal_width_for_cards(),
         ));
-        if self.results.is_empty() {
-            println!(
-                "{}",
-                self.text(
-                    "No tracks yet. Run scan to choose a folder.",
-                    "还没有歌曲。输入 扫描 来选择音乐文件夹。"
-                )
-            );
-        } else {
-            self.print_results("library");
-            println!(
-                "{}",
-                self.text(
-                    "next: play 1, shuffle, next, prev, search <query>, or library",
-                    "下一步: 播放 1、随机、下一首、上一首、搜索 <关键词>，或 曲库"
-                )
-            );
-        }
         println!();
         Ok(())
     }
@@ -662,7 +648,15 @@ impl EchoShell {
             "now" | "current" | "playing" | "当前" | "正在播放" => self.run_now(),
             "info" | "i" | "信息" | "详情" => self.run_info(argument)?,
             "status" | "状态" => self.run_status()?,
-            "devices" | "device" | "output" | "outputs" | "设备" | "输出" => self.run_devices(),
+            "devices" | "outputs" | "设备" if argument.is_empty() => self.run_devices(),
+            "devices" | "outputs" | "device" | "output" | "use-device" | "use-output" | "输出"
+            | "输出设备" => {
+                if argument.is_empty() {
+                    self.run_devices();
+                } else {
+                    self.run_use_device(argument)?;
+                }
+            }
             "doctor" | "diagnose" | "diagnostics" | "health" | "check" | "诊断" | "检查" => {
                 self.run_doctor()?
             }
@@ -1164,15 +1158,17 @@ impl EchoShell {
         let playback_track = track.clone();
         let title = track.title.clone();
         let initial_volume_percent = self.volume_percent;
+        let output_device_preference = self.output_device_preference.clone();
         thread::Builder::new()
             .name("echo-cli-playback".to_string())
             .spawn(move || {
                 let mut reported_error = false;
                 let event_tx_for_callback = event_tx.clone();
-                let result = PlaybackEngine::new().play_controlled_with_volume(
+                let result = PlaybackEngine::new().play_controlled_with_volume_and_device(
                     &playback_track,
                     control_rx,
                     initial_volume_percent,
+                    output_device_preference.as_deref(),
                     |event| {
                         if matches!(event, PlaybackEvent::Error { .. }) {
                             reported_error = true;
@@ -1640,6 +1636,10 @@ impl EchoShell {
     }
 
     fn run_devices(&self) {
+        println!(
+            "selected: {}",
+            selected_output_device_label(self.output_device_preference.as_deref())
+        );
         for audio_device in device::list_devices() {
             println!(
                 "{} [{}]{}",
@@ -1652,6 +1652,32 @@ impl EchoShell {
                 }
             );
         }
+    }
+
+    fn run_use_device(&mut self, argument: &str) -> Result<()> {
+        if device::is_default_output_selector(argument) {
+            self.paths.save_output_device_preference(None)?;
+            self.output_device_preference = None;
+            println!("{}", output_device_cleared_line(self.language));
+            if self.playback.is_some() {
+                println!("{}", output_device_next_playback_line(self.language));
+            }
+            return Ok(());
+        }
+
+        let selected = device::selected_output_device(Some(argument))?;
+        self.paths
+            .save_output_device_preference(Some(&selected.info.name))?;
+        self.output_device_preference = Some(selected.info.name.clone());
+        println!(
+            "{}",
+            output_device_saved_line(&selected.info.name, self.language)
+        );
+        println!("{}", output_device_shared_mode_line(self.language));
+        if self.playback.is_some() {
+            println!("{}", output_device_next_playback_line(self.language));
+        }
+        Ok(())
     }
 
     fn run_now(&self) {
@@ -1724,7 +1750,7 @@ impl EchoShell {
     }
 
     fn run_status(&self) -> Result<()> {
-        let default_device = device::default_device_name();
+        let output_device = selected_output_device_label(self.output_device_preference.as_deref());
         let database_path = self.paths.database_path().display().to_string();
         print_lines(status_lines(StatusSnapshot {
             track_count: self.database.track_count()?,
@@ -1732,7 +1758,7 @@ impl EchoShell {
             result_label: &self.result_label,
             result_query: &self.result_query,
             has_more_results: self.has_more_results,
-            default_device: &default_device,
+            default_device: &output_device,
             playback: self.playback_meter(),
             current_title: self
                 .current_track
@@ -1760,6 +1786,10 @@ impl EchoShell {
             audio_backend_wasapi::exclusive_status_line()
         );
         println!("default device      {}", device::default_device_name());
+        println!(
+            "selected output     {}",
+            selected_output_device_label(self.output_device_preference.as_deref())
+        );
         println!(
             "database            {}",
             self.paths.database_path().display()
@@ -4178,6 +4208,11 @@ fn command_suggestions(input: &str) -> Vec<CommandSuggestion> {
             description: "list output devices",
         },
         CommandSuggestion {
+            completion: "/use-device ",
+            usage: "/use-device <id-or-name>",
+            description: "save output device",
+        },
+        CommandSuggestion {
             completion: "/health",
             usage: "/health",
             description: "same as doctor",
@@ -4273,6 +4308,11 @@ fn command_suggestions(input: &str) -> Vec<CommandSuggestion> {
             description: "same as devices",
         },
         CommandSuggestion {
+            completion: "device default",
+            usage: "device default",
+            description: "use system default output",
+        },
+        CommandSuggestion {
             completion: "outputs",
             usage: "outputs",
             description: "same as devices",
@@ -4283,9 +4323,19 @@ fn command_suggestions(input: &str) -> Vec<CommandSuggestion> {
             description: "same as devices",
         },
         CommandSuggestion {
+            completion: "output default",
+            usage: "output default",
+            description: "use system default output",
+        },
+        CommandSuggestion {
             completion: "输出",
             usage: "输出",
             description: "same as devices",
+        },
+        CommandSuggestion {
+            completion: "use-device ",
+            usage: "use-device <id-or-name>",
+            description: "save output device",
         },
         CommandSuggestion {
             completion: "doctor",
@@ -4458,6 +4508,8 @@ fn localized_command_description(
         "show shell status" => "显示 shell 状态",
         "list output devices" => "列出输出设备",
         "same as devices" => "同 设备",
+        "save output device" => "保存输出设备",
+        "use system default output" => "使用系统默认输出",
         "print diagnostics" => "打印诊断信息",
         "same as doctor" => "同 诊断",
         "show recent scan errors" => "显示最近扫描错误",
@@ -4635,8 +4687,8 @@ fn seek_undo_prompt_label(meter: &PlaybackMeter) -> String {
 
 fn terminal_width_for_cards() -> usize {
     terminal::size()
-        .map(|(width, _)| usize::from(width).clamp(64, 96))
-        .unwrap_or(82)
+        .map(|(width, _)| usize::from(width).clamp(64, 88))
+        .unwrap_or(84)
 }
 
 fn welcome_card_lines(
@@ -4647,11 +4699,15 @@ fn welcome_card_lines(
 ) -> Vec<String> {
     let width = width.max(72);
     let inner_width = width.saturating_sub(4);
-    let split_total = width.saturating_sub(7);
-    let left_width = (split_total * 42 / 100).clamp(28, split_total.saturating_sub(28));
-    let right_width = split_total.saturating_sub(left_width);
-    let rule = format!("+{}+", "-".repeat(width.saturating_sub(2)));
-    let mut lines = vec![rule.clone()];
+    let top_rule = format!("╭{}╮", "─".repeat(width.saturating_sub(2)));
+    let bottom_rule = format!("╰{}╯", "─".repeat(width.saturating_sub(2)));
+    let mut lines = vec![top_rule];
+
+    lines.push(card_blank_row(inner_width));
+    for mark_line in echo_mark_lines() {
+        lines.push(card_center_row(mark_line, inner_width));
+    }
+    lines.push(card_blank_row(inner_width));
 
     match language {
         ShellLanguage::English => {
@@ -4662,154 +4718,98 @@ fn welcome_card_lines(
                 ),
                 inner_width,
             ));
-            lines.push(card_split_row(
-                "Welcome back",
-                "Tips for getting started",
-                left_width,
-                right_width,
-            ));
-            lines.push(card_split_row(
+            lines.push(card_label_row(
+                "state",
                 &format!(
-                    "{} tracks / {}",
+                    "{} · {} tracks indexed · output {}",
+                    if track_count == 0 { "empty" } else { "ready" },
                     track_count,
-                    if track_count == 0 { "empty" } else { "indexed" }
+                    compact(default_device, inner_width.saturating_sub(38))
                 ),
-                "scan or add    choose a music folder",
-                left_width,
-                right_width,
+                inner_width,
             ));
-            lines.push(card_split_row(
-                &format!(
-                    "output {}",
-                    compact(default_device, left_width.saturating_sub(7))
-                ),
-                "play 1         play the first result",
-                left_width,
-                right_width,
-            ));
-            lines.push(card_split_row(
+            lines.push(card_divider(inner_width));
+            lines.push(card_label_row(
+                "play",
                 if track_count == 0 {
-                    "state ready to scan"
+                    "scan        add          devices       help"
                 } else {
-                    "state ready to play"
+                    "play 1      shuffle      search <query>       library"
                 },
-                "Tab            accept the top suggestion",
-                left_width,
-                right_width,
+                inner_width,
             ));
-            lines.push(card_divider(left_width, right_width));
-            lines.push(card_split_row(
-                "Now",
-                "What's next",
-                left_width,
-                right_width,
+            lines.push(card_label_row(
+                "control",
+                "queue       next         prev                 seek +10",
+                inner_width,
             ));
-            lines.push(card_split_row(
-                "echo ready> shell",
-                if track_count == 0 {
-                    "scan"
-                } else {
-                    "play 1 / shuffle"
-                },
-                left_width,
-                right_width,
-            ));
-            lines.push(card_split_row(
-                "history saved",
-                "search moon / info 1 / open 1",
-                left_width,
-                right_width,
-            ));
-            lines.push(card_split_row(
-                "normal scrollback",
-                "pause / resume / stop / next",
-                left_width,
-                right_width,
+            lines.push(card_label_row(
+                "guide",
+                "volume 65   device <pick> Enter tips          help",
+                inner_width,
             ));
             lines.push(card_blank_row(inner_width));
             lines.push(card_row(
-                "Type a prefix to see commands. Empty Enter shows what to do next.",
+                "Full tables stay quiet until you ask: library / list / recent.",
                 inner_width,
             ));
         }
         ShellLanguage::Chinese => {
             lines.push(card_row(
-                &format!("{APP_NAME} {}  本地音乐 shell", env!("CARGO_PKG_VERSION")),
+                &format!("{APP_NAME} {}  本地音乐控制台", env!("CARGO_PKG_VERSION")),
                 inner_width,
             ));
-            lines.push(card_split_row(
-                "欢迎回来",
-                "开始提示",
-                left_width,
-                right_width,
-            ));
-            lines.push(card_split_row(
+            lines.push(card_label_row(
+                "状态",
                 &format!(
-                    "{} 首歌 / {}",
-                    track_count,
+                    "{} · {} 首歌已入库 · 输出 {}",
                     if track_count == 0 {
-                        "空曲库"
+                        "待扫描"
                     } else {
-                        "已入库"
-                    }
+                        "就绪"
+                    },
+                    track_count,
+                    compact(default_device, inner_width.saturating_sub(38))
                 ),
-                "扫描 或 添加    选择音乐文件夹",
-                left_width,
-                right_width,
+                inner_width,
             ));
-            lines.push(card_split_row(
-                &format!(
-                    "输出 {}",
-                    compact(default_device, left_width.saturating_sub(7))
-                ),
-                "播放 1         播放第一个结果",
-                left_width,
-                right_width,
-            ));
-            lines.push(card_split_row(
+            lines.push(card_divider(inner_width));
+            lines.push(card_label_row(
+                "播放",
                 if track_count == 0 {
-                    "状态 准备扫描"
+                    "扫描        添加         设备         帮助"
                 } else {
-                    "状态 准备播放"
+                    "播放 1      随机         搜索 <关键词>       曲库"
                 },
-                "Tab            接受第一条建议",
-                left_width,
-                right_width,
+                inner_width,
             ));
-            lines.push(card_divider(left_width, right_width));
-            lines.push(card_split_row("现在", "下一步", left_width, right_width));
-            lines.push(card_split_row(
-                "echo ready> shell",
-                if track_count == 0 {
-                    "扫描"
-                } else {
-                    "播放 1 / 随机"
-                },
-                left_width,
-                right_width,
+            lines.push(card_label_row(
+                "控制",
+                "队列        下一首       上一首              seek +10",
+                inner_width,
             ));
-            lines.push(card_split_row(
-                "历史会保存",
-                "搜索 moon / 信息 1 / 打开 1",
-                left_width,
-                right_width,
-            ));
-            lines.push(card_split_row(
-                "普通滚动历史",
-                "暂停 / 继续 / 停止 / 下一首",
-                left_width,
-                right_width,
+            lines.push(card_label_row(
+                "提示",
+                "音量 65     输出设备 <名称>  空 Enter          帮助",
+                inner_width,
             ));
             lines.push(card_blank_row(inner_width));
             lines.push(card_row(
-                "输入前缀就会显示候选；空 Enter 会告诉你下一步。",
+                "完整表格默认收起；输入 曲库 / 列表 / 最近 时展开。",
                 inner_width,
             ));
         }
     }
 
-    lines.push(rule);
+    lines.push(bottom_rule);
     lines
+}
+
+fn echo_mark_lines() -> &'static [&'static str] {
+    &[
+        "          ╭──╮       ╭────╮       ╭──╮          ",
+        "──────────╯  ╰───────╯    ╰───────╯  ╰──────────",
+    ]
 }
 
 fn print_welcome_card_lines(lines: &[String]) {
@@ -4817,57 +4817,218 @@ fn print_welcome_card_lines(lines: &[String]) {
         let is_rule = index == 0 || index + 1 == lines.len();
         if is_rule {
             println!("{}", line.as_str().with(Color::DarkGrey));
+        } else if is_echo_mark_line(line) {
+            print_welcome_content_line(line, welcome_accent_color(), true);
         } else if line.contains(APP_NAME) {
-            println!("{}", line.as_str().with(Color::Cyan).bold());
-        } else if line.contains("-+-") {
+            print_welcome_content_line(line, Color::White, true);
+        } else if is_card_divider(line) {
             println!("{}", line.as_str().with(Color::DarkGrey));
-        } else if line.contains("Welcome back")
-            || line.contains("Tips for getting started")
-            || line.contains("What's next")
-            || line.contains("欢迎回来")
-            || line.contains("开始提示")
-            || line.contains("下一步")
+        } else if is_welcome_label_line(line) {
+            print_welcome_label_line(line);
+        } else if line.contains("Full tables")
+            || line.contains("完整表格")
+            || line.trim().starts_with('│')
         {
-            println!("{}", line.as_str().with(Color::DarkYellow).bold());
+            print_welcome_content_line(line, welcome_muted_color(), false);
         } else {
-            println!("{line}");
+            print_welcome_content_line(line, Color::Grey, false);
         }
     }
 }
 
+fn welcome_accent_color() -> Color {
+    Color::Rgb {
+        r: 120,
+        g: 218,
+        b: 209,
+    }
+}
+
+fn welcome_label_color() -> Color {
+    Color::Rgb {
+        r: 143,
+        g: 225,
+        b: 216,
+    }
+}
+
+fn welcome_muted_color() -> Color {
+    Color::DarkGrey
+}
+
+fn print_welcome_content_line(line: &str, color: Color, bold: bool) {
+    let Some((left_border, content, right_border)) = split_card_borders(line) else {
+        if bold {
+            println!("{}", line.with(color).bold());
+        } else {
+            println!("{}", line.with(color));
+        }
+        return;
+    };
+
+    print!("{}", left_border.with(Color::DarkGrey));
+    if bold {
+        print!("{}", content.with(color).bold());
+    } else {
+        print!("{}", content.with(color));
+    }
+    println!("{}", right_border.with(Color::DarkGrey));
+}
+
+fn print_welcome_label_line(line: &str) {
+    let Some((left_border, content, right_border)) = split_card_borders(line) else {
+        println!("{}", line.with(Color::Grey));
+        return;
+    };
+    let Some(label_end) = byte_index_after_display_width(content, WELCOME_LABEL_WIDTH + 1) else {
+        print_welcome_content_line(line, Color::Grey, false);
+        return;
+    };
+
+    let label = &content[..label_end];
+    let body = &content[label_end..];
+    print!("{}", left_border.with(Color::DarkGrey));
+    print!("{}", label.with(welcome_label_color()).bold());
+    print!("{}", body.with(Color::Grey));
+    println!("{}", right_border.with(Color::DarkGrey));
+}
+
+fn split_card_borders(line: &str) -> Option<(&str, &str, &str)> {
+    let (_, first) = line.char_indices().next()?;
+    let (last_index, _) = line.char_indices().last()?;
+    let first_len = first.len_utf8();
+    if last_index <= first_len {
+        return None;
+    }
+
+    Some((
+        &line[..first_len],
+        &line[first_len..last_index],
+        &line[last_index..],
+    ))
+}
+
+fn is_echo_mark_line(line: &str) -> bool {
+    echo_mark_lines()
+        .iter()
+        .any(|mark_line| line.contains(mark_line))
+}
+
+fn is_card_divider(line: &str) -> bool {
+    line.starts_with('├') && line.ends_with('┤')
+}
+
+fn is_welcome_label_line(line: &str) -> bool {
+    let Some((_, content, _)) = split_card_borders(line) else {
+        return false;
+    };
+    let trimmed = content.trim_start();
+    [
+        "state", "play", "control", "guide", "状态", "播放", "控制", "提示",
+    ]
+    .iter()
+    .any(|label| trimmed.starts_with(label))
+}
+
+const WELCOME_LABEL_WIDTH: usize = 8;
+
 fn card_row(content: &str, inner_width: usize) -> String {
     let content = fit_line_to_width(content, inner_width);
     let padding = inner_width.saturating_sub(display_width(&content) as usize);
-    format!("| {content}{} |", " ".repeat(padding))
+    format!("│ {content}{} │", " ".repeat(padding))
 }
 
-fn card_blank_row(inner_width: usize) -> String {
-    format!("| {} |", " ".repeat(inner_width))
-}
-
-fn card_split_row(left: &str, right: &str, left_width: usize, right_width: usize) -> String {
-    let left = fit_line_to_width(left, left_width);
-    let right = fit_line_to_width(right, right_width);
-    let left_padding = left_width.saturating_sub(display_width(&left) as usize);
-    let right_padding = right_width.saturating_sub(display_width(&right) as usize);
+fn card_center_row(content: &str, inner_width: usize) -> String {
+    let content = fit_line_to_width(content, inner_width);
+    let content_width = display_width(&content) as usize;
+    let padding = inner_width.saturating_sub(content_width);
+    let left_padding = padding / 2;
+    let right_padding = padding.saturating_sub(left_padding);
     format!(
-        "| {left}{} | {right}{} |",
+        "│ {}{content}{} │",
         " ".repeat(left_padding),
         " ".repeat(right_padding)
     )
 }
 
-fn card_divider(left_width: usize, right_width: usize) -> String {
+fn card_blank_row(inner_width: usize) -> String {
+    format!("│ {} │", " ".repeat(inner_width))
+}
+
+fn card_label_row(label: &str, body: &str, inner_width: usize) -> String {
+    let label = fit_line_to_width(label, WELCOME_LABEL_WIDTH);
+    let label_padding = WELCOME_LABEL_WIDTH.saturating_sub(display_width(&label) as usize);
+    let body_width = inner_width.saturating_sub(WELCOME_LABEL_WIDTH + 2);
+    let body = fit_line_to_width(body, body_width);
+    let body_padding = body_width.saturating_sub(display_width(&body) as usize);
     format!(
-        "|{}+{}|",
-        "-".repeat(left_width + 2),
-        "-".repeat(right_width + 2)
+        "│ {label}{}  {body}{} │",
+        " ".repeat(label_padding),
+        " ".repeat(body_padding)
     )
+}
+
+fn byte_index_after_display_width(value: &str, target_width: usize) -> Option<usize> {
+    let mut width = 0_usize;
+    for (index, character) in value.char_indices() {
+        if width >= target_width {
+            return Some(index);
+        }
+        width += display_char_width(character) as usize;
+    }
+
+    if width >= target_width {
+        Some(value.len())
+    } else {
+        None
+    }
+}
+
+fn card_divider(inner_width: usize) -> String {
+    format!("├{}┤", "─".repeat(inner_width + 2))
 }
 
 fn result_header(label: &str, count: usize) -> String {
     let noun = if count == 1 { "track" } else { "tracks" };
     format!("{label}: {count} {noun}")
+}
+
+fn selected_output_device_label(preference: Option<&str>) -> String {
+    preference
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("system default")
+        .to_string()
+}
+
+fn output_device_saved_line(device_name: &str, language: ShellLanguage) -> String {
+    match language {
+        ShellLanguage::English => format!("output device saved: {device_name}"),
+        ShellLanguage::Chinese => format!("已保存输出设备: {device_name}"),
+    }
+}
+
+fn output_device_cleared_line(language: ShellLanguage) -> &'static str {
+    match language {
+        ShellLanguage::English => "output device preference cleared; using system default",
+        ShellLanguage::Chinese => "已清除输出设备偏好；使用系统默认设备",
+    }
+}
+
+fn output_device_shared_mode_line(language: ShellLanguage) -> &'static str {
+    match language {
+        ShellLanguage::English => "mode: CPAL shared output",
+        ShellLanguage::Chinese => "模式: CPAL 共享输出",
+    }
+}
+
+fn output_device_next_playback_line(language: ShellLanguage) -> &'static str {
+    match language {
+        ShellLanguage::English => {
+            "current playback stays on its existing stream; next playback uses the new device"
+        }
+        ShellLanguage::Chinese => "当前播放会保持现有输出流；下一次播放会使用新设备",
+    }
 }
 
 struct StatusSnapshot<'a> {
@@ -7304,12 +7465,17 @@ fn help_lines(topic: &str) -> Vec<String> {
             "help: diagnostics".to_string(),
             "  status            show library, device, playback time, and simulated cost".to_string(),
             "  devices           list output devices".to_string(),
-            "  device            same as devices".to_string(),
+            "  device <pick>     save a shared-mode output device".to_string(),
+            "  output <pick>     same as device <pick>".to_string(),
+            "  device default    use the system default output again".to_string(),
             "  outputs           same as devices".to_string(),
             "  doctor            print runtime and audio backend diagnostics".to_string(),
             "  diagnose          same as doctor".to_string(),
             "  health            same as doctor".to_string(),
             "  open-db           open the database folder in Explorer".to_string(),
+            String::new(),
+            "WASAPI exclusive is still not enabled; device switching uses CPAL shared output."
+                .to_string(),
         ],
         "clear" | "cls" => vec![
             "help: clear".to_string(),
@@ -7340,7 +7506,7 @@ fn help_lines(topic: &str) -> Vec<String> {
         ],
         "home" | "首页" => vec![
             "help: home".to_string(),
-            "  home              show the welcome screen and current library view".to_string(),
+            "  home              show the welcome screen".to_string(),
             "  clear             clear the terminal and then show the welcome screen".to_string(),
             String::new(),
             "Use this when you feel lost and want the shell to re-orient you.".to_string(),
@@ -7621,7 +7787,18 @@ fn fit_line_to_width(value: &str, width: usize) -> String {
 }
 
 fn display_char_width(character: char) -> u16 {
-    if character.is_ascii() { 1 } else { 2 }
+    if character.is_ascii() || is_narrow_terminal_glyph(character) {
+        1
+    } else {
+        2
+    }
+}
+
+fn is_narrow_terminal_glyph(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x00B7 | 0x2500..=0x257F | 0x2580..=0x259F
+    )
 }
 
 fn duration_millis(duration: Duration) -> u64 {
@@ -8061,6 +8238,10 @@ mod tests {
             .into_iter()
             .map(|suggestion| suggestion.completion)
             .collect();
+        let use_device_completions: Vec<_> = command_suggestions("use-dev")
+            .into_iter()
+            .map(|suggestion| suggestion.completion)
+            .collect();
         let health_completions: Vec<_> = command_suggestions("he")
             .into_iter()
             .map(|suggestion| suggestion.completion)
@@ -8072,8 +8253,11 @@ mod tests {
 
         assert!(device_completions.contains(&"devices"));
         assert!(device_completions.contains(&"device"));
+        assert!(device_completions.contains(&"device default"));
         assert!(output_completions.contains(&"outputs"));
         assert!(output_completions.contains(&"output"));
+        assert!(output_completions.contains(&"output default"));
+        assert!(use_device_completions.contains(&"use-device "));
         assert!(health_completions.contains(&"health"));
         assert!(diagnose_completions.contains(&"diagnose"));
         assert!(diagnose_completions.contains(&"diagnostics"));
@@ -8696,6 +8880,7 @@ mod tests {
             active_queue: ActiveQueue::from_tracks(tracks, 0),
             queue_undo: None,
             volume_percent: DEFAULT_VOLUME_PERCENT,
+            output_device_preference: None,
             last_command: None,
             language: ShellLanguage::English,
         };
@@ -8747,6 +8932,7 @@ mod tests {
             active_queue: ActiveQueue::from_tracks(tracks, 0),
             queue_undo: None,
             volume_percent: DEFAULT_VOLUME_PERCENT,
+            output_device_preference: None,
             last_command: None,
             language: ShellLanguage::English,
         };
@@ -8802,6 +8988,7 @@ mod tests {
             active_queue: ActiveQueue::from_tracks(tracks.clone(), 0),
             queue_undo: None,
             volume_percent: DEFAULT_VOLUME_PERCENT,
+            output_device_preference: None,
             last_command: None,
             language: ShellLanguage::English,
         };
@@ -9074,17 +9261,38 @@ mod tests {
     fn welcome_card_keeps_stable_width_and_useful_commands() {
         let english = welcome_card_lines(12, "Speakers", ShellLanguage::English, 72);
         assert!(english.iter().all(|line| display_width(line) == 72));
-        assert!(english.iter().any(|line| line.contains("Welcome back")));
-        assert!(english.iter().any(|line| line.contains("scan or add")));
+        assert!(english.iter().any(|line| line.contains("╭────╮")));
+        assert!(
+            english
+                .iter()
+                .any(|line| line.contains("local music shell"))
+        );
+        assert!(english.iter().any(|line| line.contains("state")));
+        assert!(english.iter().any(|line| line.contains("play")));
+        assert!(english.iter().any(|line| line.contains("control")));
+        assert!(english.iter().any(|line| line.contains("guide")));
         assert!(english.iter().any(|line| line.contains("play 1")));
-        assert!(english.iter().any(|line| line.contains("Empty Enter")));
+        assert!(english.iter().any(|line| line.contains("queue")));
+        assert!(english.iter().any(|line| line.contains("Enter tips")));
+        assert!(english.iter().any(|line| line.contains("library / list")));
+        assert!(!english.iter().any(|line| line.contains("Welcome back")));
+        assert!(!english.iter().any(|line| line.contains("-+-")));
+        assert!(!english.iter().any(|line| line.contains("▛")));
+        assert!(!english.iter().any(|line| line.contains("████")));
+        assert!(
+            echo_mark_lines()
+                .iter()
+                .all(|line| !line.chars().any(|ch| ch.is_ascii_alphabetic()))
+        );
 
         let chinese = welcome_card_lines(0, "Mi Monitor", ShellLanguage::Chinese, 72);
         assert!(chinese.iter().all(|line| display_width(line) == 72));
-        assert!(chinese.iter().any(|line| line.contains("欢迎回来")));
-        assert!(chinese.iter().any(|line| line.contains("扫描 或 添加")));
-        assert!(chinese.iter().any(|line| line.contains("播放 1")));
+        assert!(chinese.iter().any(|line| line.contains("╭────╮")));
+        assert!(chinese.iter().any(|line| line.contains("本地音乐")));
+        assert!(chinese.iter().any(|line| line.contains("扫描")));
+        assert!(chinese.iter().any(|line| line.contains("队列")));
         assert!(chinese.iter().any(|line| line.contains("空 Enter")));
+        assert!(chinese.iter().any(|line| line.contains("完整表格默认收起")));
     }
 
     #[test]
@@ -10473,9 +10681,12 @@ mod tests {
         let lines = help_lines("health");
 
         assert!(lines.iter().any(|line| line.contains("device")));
+        assert!(lines.iter().any(|line| line.contains("device <pick>")));
+        assert!(lines.iter().any(|line| line.contains("device default")));
         assert!(lines.iter().any(|line| line.contains("outputs")));
         assert!(lines.iter().any(|line| line.contains("diagnose")));
         assert!(lines.iter().any(|line| line.contains("health")));
+        assert!(lines.iter().any(|line| line.contains("WASAPI exclusive")));
     }
 
     #[test]

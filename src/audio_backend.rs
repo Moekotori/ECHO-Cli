@@ -1,6 +1,7 @@
 use crate::decoder::{DecodeStreamInfo, SampleChunk};
+use crate::device;
 use crate::error::{EchoError, Result};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{SampleFormat, SampleRate, Stream, StreamConfig, SupportedStreamConfig};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -26,20 +27,16 @@ pub struct SharedOutput {
 }
 
 impl SharedOutput {
-    pub fn open_with_volume(
+    pub fn open_with_volume_on_device(
         stream_info: &DecodeStreamInfo,
         sample_rx: Receiver<SampleChunk>,
         queued_samples: Arc<AtomicI64>,
         initial_volume_percent: u8,
+        output_device_selector: Option<&str>,
     ) -> Result<Self> {
-        let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or_else(|| EchoError::Audio("no default output device found".to_string()))?;
-        let device_name = device
-            .name()
-            .unwrap_or_else(|_| "unknown output device".to_string());
-        let supported = select_output_config(&device, stream_info)?;
+        let selected_device = device::selected_output_device(output_device_selector)?;
+        let device_name = selected_device.info.name.clone();
+        let supported = select_output_config(&selected_device.device, stream_info)?;
         let config = supported.config();
         let sample_format = supported.sample_format();
         let mut warnings = Vec::new();
@@ -70,7 +67,7 @@ impl SharedOutput {
         let volume_percent = Arc::new(AtomicU32::new(initial_volume_percent.min(100) as u32));
         let current_generation = Arc::new(AtomicU64::new(0));
         let stream = build_stream(
-            &device,
+            &selected_device.device,
             &config,
             sample_format,
             stream_info.channel_count,
